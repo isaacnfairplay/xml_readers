@@ -108,11 +108,53 @@ func ReadWorkbook(zipReader *zip.ReadCloser) (*Workbook, error) {
 	return &workbook, err
 }
 
-// Read shared strings from sharedStrings.xml
+// ReadSharedStrings extracts shared strings from an XLSX file.
 func ReadSharedStrings(zipReader *zip.ReadCloser) (*SharedStrings, error) {
-	var sharedStrings SharedStrings
-	err := readXMLFromZip(zipReader, "xl/sharedStrings.xml", &sharedStrings)
-	return &sharedStrings, err
+	for _, file := range zipReader.File {
+		if file.Name == "xl/sharedStrings.xml" {
+			f, err := file.Open()
+			if err != nil {
+				return nil, err
+			}
+			defer f.Close()
+
+			bufferedReader := bufio.NewReaderSize(f, 64*1024) // Buffer for performance
+			decoder := xml.NewDecoder(bufferedReader)
+
+			var sharedStrings SharedStrings
+			for {
+				t, err := decoder.Token()
+				if err != nil {
+					if err == io.EOF {
+						break
+					}
+					return nil, err
+				}
+				switch se := t.(type) {
+				case xml.StartElement:
+					if se.Name.Local == "si" {
+						var text struct {
+							T string `xml:"t"`
+						}
+						if err := decoder.DecodeElement(&text, &se); err == nil {
+							sharedStrings.Items = append(sharedStrings.Items, text.T)
+						}
+					}
+				}
+			}
+
+			// Debugging statement to print shared string size
+			sharedStringCount := len(sharedStrings.Items)
+
+			// Optional: warn if shared string count exceeds a threshold
+			if sharedStringCount > 1000_000 {
+				fmt.Println("Warning: Large shared strings dataset detected, consider optimizing lookup.")
+			}
+
+			return &sharedStrings, nil
+		}
+	}
+	return nil, fmt.Errorf("shared strings file not found")
 }
 
 // Read sheet data and return parsed cell data
