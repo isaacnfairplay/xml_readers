@@ -125,7 +125,7 @@ func ReadWorkbook(zipReader *zip.ReadCloser) (*Workbook, error) {
 	return nil, fmt.Errorf("workbook.xml not found")
 }
 
-// Optimized ReadSheetData function
+// Optimized ReadSheetData function using event-driven XML parsing
 func ReadSheetData(zipReader *zip.ReadCloser, fileName string, sharedStrings *SharedStrings) ([]CellData, error) {
 	for _, file := range zipReader.File {
 		if file.Name == fileName {
@@ -135,16 +135,15 @@ func ReadSheetData(zipReader *zip.ReadCloser, fileName string, sharedStrings *Sh
 			}
 			defer f.Close()
 
-			// Buffer size can be increased depending on file size, but 64KB is a good start
 			bufferedReader := bufio.NewReaderSize(f, 64*1024)
 			decoder := xml.NewDecoder(bufferedReader)
 
 			var cellData []CellData
-			var currentSheet string // Set the correct sheet name externally
+			var currentSheet string
 			var currentRow int32
+			var cell Cell
 
 			for {
-				// Get the next XML token
 				t, err := decoder.Token()
 				if err != nil {
 					if err == io.EOF {
@@ -155,54 +154,53 @@ func ReadSheetData(zipReader *zip.ReadCloser, fileName string, sharedStrings *Sh
 
 				switch se := t.(type) {
 				case xml.StartElement:
-					// Handle <row> elements
 					if se.Name.Local == "row" {
 						for _, attr := range se.Attr {
 							if attr.Name.Local == "r" {
-								// Parse row number and convert to int32
-								rowNum, parseErr := strconv.Atoi(attr.Value)
-								if parseErr == nil {
-									currentRow = int32(rowNum) // Use currentRow for the row level
-								}
+								rowNum, _ := strconv.Atoi(attr.Value)
+								currentRow = int32(rowNum)
 							}
 						}
 					}
 
-					// Handle <c> elements (cells)
 					if se.Name.Local == "c" {
-						var cell Cell
-						// Decode the cell element
-						if err := decoder.DecodeElement(&cell, &se); err != nil {
-							return nil, err
-						}
-
-						// Parse the cell reference (like "A1")
-						column, _ := parseCellReference(cell.R)
-
-						// Determine the value of the cell
-						var value string
-						if cell.T == "s" { // Shared string
-							idx, parseErr := strconv.Atoi(cell.V)
-							if parseErr == nil && idx < len(sharedStrings.Items) {
-								value = sharedStrings.Items[idx]
+						for _, attr := range se.Attr {
+							if attr.Name.Local == "r" {
+								// Get column and row reference from cell (e.g., "A1")
+								cell.R = attr.Value
+							} else if attr.Name.Local == "t" {
+								// Type attribute, e.g., shared string "s"
+								cell.T = attr.Value
 							}
-						} else { // Numeric or other type
-							value = cell.V
 						}
-
-						// Collect the cell data with currentRow now actively used
-						cellData = append(cellData, CellData{
-							SheetName:    currentSheet,
-							RowNumber:    currentRow, // Use the currentRow value
-							ColumnNumber: column,
-							SheetValue:   value,
-						})
 					}
 
 				case xml.EndElement:
-					// Reset row data at the end of each <row> element
-					if se.Name.Local == "row" {
-						currentRow = 0
+					// End of cell element: decode value and store it
+					if se.Name.Local == "c" {
+						// Handle cell value (shared string or direct value)
+						var value string
+						if cell.T == "s" {
+							// It's a shared string, so look it up
+							idx, _ := strconv.Atoi(cell.V)
+							if idx < len(sharedStrings.Items) {
+								value = sharedStrings.Items[idx]
+							}
+						} else {
+							// It's a regular value (number, etc.)
+							value = cell.V
+						}
+
+						// Parse the cell reference to get the column and row
+						column, _ := parseCellReference(cell.R)
+
+						// Add to cell data
+						cellData = append(cellData, CellData{
+							SheetName:    currentSheet,
+							RowNumber:    currentRow,
+							ColumnNumber: column,
+							SheetValue:   value,
+						})
 					}
 				}
 			}
