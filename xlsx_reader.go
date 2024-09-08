@@ -2,6 +2,7 @@ package main
 
 import (
 	"archive/zip"
+	"bufio"
 	"encoding/csv"
 	"encoding/json"
 	"encoding/xml"
@@ -85,10 +86,37 @@ func ReadWorkbook(zipReader *zip.ReadCloser) (*Workbook, error) {
 			}
 			defer f.Close()
 
+			// Use a larger buffer for reading the file
+			bufferedReader := bufio.NewReaderSize(f, 64*1024)
+
+			// Parse only the relevant portions of the XML
+			decoder := xml.NewDecoder(bufferedReader)
 			var workbook Workbook
-			decoder := xml.NewDecoder(f)
-			if err := decoder.Decode(&workbook); err != nil {
-				return nil, err
+			inSheets := false
+			for {
+				t, err := decoder.Token()
+				if err != nil {
+					break
+				}
+				switch se := t.(type) {
+				case xml.StartElement:
+					if se.Name.Local == "sheets" {
+						inSheets = true
+					} else if se.Name.Local == "sheet" && inSheets {
+						var sheet struct {
+							Name string `xml:"name,attr"`
+							ID   string `xml:"sheetId,attr"`
+							RID  string `xml:"r:id,attr"`
+						}
+						if err := decoder.DecodeElement(&sheet, &se); err == nil {
+							workbook.Sheets.Sheet = append(workbook.Sheets.Sheet, sheet)
+						}
+					}
+				case xml.EndElement:
+					if se.Name.Local == "sheets" {
+						inSheets = false
+					}
+				}
 			}
 			return &workbook, nil
 		}
@@ -106,10 +134,35 @@ func ReadSheetData(zipReader *zip.ReadCloser, fileName string) (*SheetData, erro
 			}
 			defer f.Close()
 
+			bufferedReader := bufio.NewReaderSize(f, 64*1024)
+			decoder := xml.NewDecoder(bufferedReader)
+
+			// Manually parse only the <sheetData> element
 			var sheetData SheetData
-			decoder := xml.NewDecoder(f)
-			if err := decoder.Decode(&sheetData); err != nil {
-				return nil, err
+			inSheetData := false
+			for {
+				t, err := decoder.Token()
+				if err != nil {
+					break
+				}
+				switch se := t.(type) {
+				case xml.StartElement:
+					if se.Name.Local == "sheetData" {
+						inSheetData = true
+					} else if se.Name.Local == "row" && inSheetData {
+						var row struct {
+							R int32  `xml:"r,attr"`
+							C []Cell `xml:"c"`
+						}
+						if err := decoder.DecodeElement(&row, &se); err == nil {
+							sheetData.Row = append(sheetData.Row, row)
+						}
+					}
+				case xml.EndElement:
+					if se.Name.Local == "sheetData" {
+						inSheetData = false
+					}
+				}
 			}
 			return &sheetData, nil
 		}
@@ -159,10 +212,26 @@ func ReadSharedStrings(zipReader *zip.ReadCloser) (*SharedStrings, error) {
 			}
 			defer f.Close()
 
+			bufferedReader := bufio.NewReaderSize(f, 64*1024)
+			decoder := xml.NewDecoder(bufferedReader)
+
 			var sharedStrings SharedStrings
-			decoder := xml.NewDecoder(f)
-			if err := decoder.Decode(&sharedStrings); err != nil {
-				return nil, err
+			for {
+				t, err := decoder.Token()
+				if err != nil {
+					break
+				}
+				switch se := t.(type) {
+				case xml.StartElement:
+					if se.Name.Local == "si" {
+						var text struct {
+							T string `xml:"t"`
+						}
+						if err := decoder.DecodeElement(&text, &se); err == nil {
+							sharedStrings.Items = append(sharedStrings.Items, text.T)
+						}
+					}
+				}
 			}
 			return &sharedStrings, nil
 		}
