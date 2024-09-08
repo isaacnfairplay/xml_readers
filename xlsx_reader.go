@@ -20,8 +20,8 @@ import (
 // Struct to hold cell data information
 type CellData struct {
 	SheetName    string `json:"sheet_name"`
-	RowNumber    int32  `json:"row_number"`    // Optimized to int32 for smaller storage
-	ColumnNumber int32  `json:"column_number"` // Optimized to int32
+	RowNumber    int32  `json:"row_number"`
+	ColumnNumber int32  `json:"column_number"`
 	SheetValue   string `json:"sheet_value"`
 	Merged       bool   `json:"merged,omitempty"`
 	MergedRange  string `json:"merged_range,omitempty"`
@@ -35,41 +35,30 @@ type MergedCell struct {
 	EndColumn   int32
 }
 
-// Structs for Workbook, SheetData, etc.
+// Cell represents a single cell in a sheet
+type Cell struct {
+	R string `xml:"r,attr"` // Reference (e.g., "A1")
+	T string `xml:"t,attr"` // Type (e.g., "s" for shared string, "n" for number)
+	V string `xml:"v"`      // Value (content of the cell)
+}
+
+// Workbook represents the workbook.xml structure, containing sheet names
 type Workbook struct {
 	Sheets struct {
 		Sheet []struct {
 			Name string `xml:"name,attr"`
 			ID   string `xml:"sheetId,attr"`
+			RID  string `xml:"r:id,attr"`
 		} `xml:"sheet"`
 	} `xml:"sheets"`
 }
 
+// SharedStrings represents shared strings in the workbook
 type SharedStrings struct {
 	Items []string `xml:"si>t"`
 }
 
-type Cell struct {
-	R string `xml:"r,attr"`
-	T string `xml:"t,attr"`
-	V string `xml:"v"`
-}
-
-type SheetData struct {
-	Row []struct {
-		R int32  `xml:"r,attr"`
-		C []Cell `xml:"c"`
-	} `xml:"sheetData>row"`
-}
-
-type MergeCells struct {
-	Cells []struct {
-		Ref string `xml:"ref,attr"`
-	} `xml:"mergeCells>mergeCell"`
-}
-
-// Core Functions
-
+// ReadWorkbook extracts the list of sheets from the workbook.xml file.
 func ReadWorkbook(zipReader *zip.ReadCloser) (*Workbook, error) {
 	for _, file := range zipReader.File {
 		if file.Name == "xl/workbook.xml" {
@@ -79,11 +68,38 @@ func ReadWorkbook(zipReader *zip.ReadCloser) (*Workbook, error) {
 			}
 			defer f.Close()
 
-			bufferedReader := bufio.NewReaderSize(f, 64*1024)
+			bufferedReader := bufio.NewReaderSize(f, 128*1024) // Increased buffer size
 			decoder := xml.NewDecoder(bufferedReader)
 			var workbook Workbook
-			if err := decoder.Decode(&workbook); err != nil {
-				return nil, err
+			inSheets := false
+
+			for {
+				t, err := decoder.Token()
+				if err != nil {
+					if err == io.EOF {
+						break
+					}
+					return nil, err
+				}
+				switch se := t.(type) {
+				case xml.StartElement:
+					if se.Name.Local == "sheets" {
+						inSheets = true
+					} else if se.Name.Local == "sheet" && inSheets {
+						var sheet struct {
+							Name string `xml:"name,attr"`
+							ID   string `xml:"sheetId,attr"`
+							RID  string `xml:"r:id,attr"`
+						}
+						if err := decoder.DecodeElement(&sheet, &se); err == nil {
+							workbook.Sheets.Sheet = append(workbook.Sheets.Sheet, sheet)
+						}
+					}
+				case xml.EndElement:
+					if se.Name.Local == "sheets" {
+						inSheets = false
+					}
+				}
 			}
 			return &workbook, nil
 		}
@@ -91,6 +107,7 @@ func ReadWorkbook(zipReader *zip.ReadCloser) (*Workbook, error) {
 	return nil, fmt.Errorf("workbook.xml not found")
 }
 
+// ReadSharedStrings extracts shared strings from an XLSX file.
 func ReadSharedStrings(zipReader *zip.ReadCloser) (*SharedStrings, error) {
 	for _, file := range zipReader.File {
 		if file.Name == "xl/sharedStrings.xml" {
@@ -100,69 +117,92 @@ func ReadSharedStrings(zipReader *zip.ReadCloser) (*SharedStrings, error) {
 			}
 			defer f.Close()
 
-			bufferedReader := bufio.NewReaderSize(f, 64*1024)
+			bufferedReader := bufio.NewReaderSize(f, 64*1024) // Buffer for performance
 			decoder := xml.NewDecoder(bufferedReader)
+
 			var sharedStrings SharedStrings
-			if err := decoder.Decode(&sharedStrings); err != nil {
-				return nil, err
+			for {
+				t, err := decoder.Token()
+				if err != nil {
+					if err == io.EOF {
+						break
+					}
+					return nil, err
+				}
+				switch se := t.(type) {
+				case xml.StartElement:
+					if se.Name.Local == "si" {
+						var text struct {
+							T string `xml:"t"`
+						}
+						if err := decoder.DecodeElement(&text, &se); err == nil {
+							sharedStrings.Items = append(sharedStrings.Items, text.T)
+						}
+					}
+				}
 			}
 			return &sharedStrings, nil
 		}
 	}
-	return nil, fmt.Errorf("sharedStrings.xml not found")
+	return nil, fmt.Errorf("shared strings file not found")
 }
 
+// ReadSheetData extracts sheet data from an XLSX file for a specific sheet file.
 func ReadSheetData(zipReader *zip.ReadCloser, fileName string, sharedStrings *SharedStrings) ([]CellData, error) {
-	var cellData []CellData
 	for _, file := range zipReader.File {
-		if file.Name != fileName {
-			continue
-		}
-		f, err := file.Open()
-		if err != nil {
-			return nil, err
-		}
-		defer f.Close()
-
-		decoder := xml.NewDecoder(bufio.NewReaderSize(f, 64*1024))
-		var currentRow int32
-
-		for {
-			t, err := decoder.Token()
+		if file.Name == fileName {
+			f, err := file.Open()
 			if err != nil {
-				if err == io.EOF {
-					break
-				}
 				return nil, err
 			}
+			defer f.Close()
 
-			switch se := t.(type) {
-			case xml.StartElement:
-				switch se.Name.Local {
-				case "row":
-					for _, attr := range se.Attr {
-						if attr.Name.Local == "r" {
-							currentRow, _ = Atoi32(attr.Value)
+			// Buffered reader for performance
+			decoder := xml.NewDecoder(bufio.NewReaderSize(f, 128*1024))
+			var cellData []CellData
+			var currentRow int32
+
+			for {
+				t, err := decoder.Token()
+				if err != nil {
+					if err == io.EOF {
+						break
+					}
+					return nil, err
+				}
+
+				switch se := t.(type) {
+				case xml.StartElement:
+					if se.Name.Local == "row" {
+						for _, attr := range se.Attr {
+							if attr.Name.Local == "r" {
+								currentRow, _ = Atoi32(attr.Value)
+							}
 						}
 					}
-				case "c":
-					var cell Cell
-					decoder.DecodeElement(&cell, &se)
-					column, _ := parseCellReference(cell.R)
-					value := getCellValue(cell, sharedStrings)
 
-					cellData = append(cellData, CellData{
-						RowNumber:    currentRow,
-						ColumnNumber: column,
-						SheetValue:   value,
-					})
+					if se.Name.Local == "c" {
+						var cell Cell
+						decoder.DecodeElement(&cell, &se)
+
+						column, _ := parseCellReference(cell.R)
+						value := getCellValue(cell, sharedStrings)
+
+						cellData = append(cellData, CellData{
+							RowNumber:    currentRow,
+							ColumnNumber: column,
+							SheetValue:   value,
+						})
+					}
 				}
 			}
+			return cellData, nil
 		}
 	}
-	return cellData, nil
+	return nil, fmt.Errorf("sheet file not found")
 }
 
+// ReadMergedCells extracts merged cell ranges from an XLSX file for a specific sheet.
 func ReadMergedCells(zipReader *zip.ReadCloser, fileName string) ([]MergedCell, error) {
 	for _, file := range zipReader.File {
 		if file.Name == fileName {
@@ -172,7 +212,11 @@ func ReadMergedCells(zipReader *zip.ReadCloser, fileName string) ([]MergedCell, 
 			}
 			defer f.Close()
 
-			var mergeCells MergeCells
+			var mergeCells struct {
+				Cells []struct {
+					Ref string `xml:"ref,attr"`
+				} `xml:"mergeCells>mergeCell"`
+			}
 			decoder := xml.NewDecoder(f)
 			if err := decoder.Decode(&mergeCells); err != nil {
 				return nil, err
@@ -194,23 +238,13 @@ func ReadMergedCells(zipReader *zip.ReadCloser, fileName string) ([]MergedCell, 
 	return nil, nil
 }
 
-// Utility Functions
-
-func getCellValue(cell Cell, sharedStrings *SharedStrings) string {
-	if cell.T == "s" {
-		if idx, err := strconv.Atoi(cell.V); err == nil && idx < len(sharedStrings.Items) {
-			return sharedStrings.Items[idx]
-		}
-	}
-	return cell.V
-}
-
+// Utility: Parse cell reference like "A1" and return column and row as int32
 func parseCellReference(ref string) (int32, int32) {
 	col := int32(0)
 	row := int32(0)
 	for i := 0; i < len(ref); i++ {
 		if ref[i] >= 'A' && ref[i] <= 'Z' {
-			col = col*26 + int32(ref[i]-'A'+1)
+			col = int32(col*26 + int32(ref[i]-'A'+1))
 		} else {
 			rowPart, _ := strconv.Atoi(ref[i:])
 			row = int32(rowPart)
@@ -220,15 +254,7 @@ func parseCellReference(ref string) (int32, int32) {
 	return col, row
 }
 
-func cellReferenceFromCoordinates(col int32, row int32) string {
-	colRef := ""
-	for col > 0 {
-		colRef = string('A'+(col-1)%26) + colRef
-		col = (col - 1) / 26
-	}
-	return fmt.Sprintf("%s%d", colRef, row)
-}
-
+// Utility: Parse merged cell range like "A1:B2" and return start and end rows/columns
 func parseMergedCellRange(ref string) (int32, int32, int32, int32) {
 	parts := strings.Split(ref, ":")
 	if len(parts) == 2 {
@@ -239,31 +265,51 @@ func parseMergedCellRange(ref string) (int32, int32, int32, int32) {
 	return 0, 0, 0, 0
 }
 
+// Utility: Create cell reference from column and row (e.g., 1, 1 becomes "A1")
+func cellReferenceFromCoordinates(col int32, row int32) string {
+	colRef := ""
+	for col > 0 {
+		colRef = string('A'+(col-1)%26) + colRef
+		col = (col - 1) / 26
+	}
+	return fmt.Sprintf("%s%d", colRef, row)
+}
+
+// Utility: Get cell value, handles shared strings
+func getCellValue(cell Cell, sharedStrings *SharedStrings) string {
+	if cell.T == "s" { // Shared string
+		if idx, err := strconv.Atoi(cell.V); err == nil && idx < len(sharedStrings.Items) {
+			return sharedStrings.Items[idx]
+		}
+	}
+	return cell.V // Numeric or other type
+}
+
+// Utility: Convert string to int32
 func Atoi32(s string) (int32, error) {
 	i, err := strconv.Atoi(s)
 	return int32(i), err
 }
 
-// Profiling Setup
-
+// Profiling setup and teardown
 func setupProfiling(cpuProfile, memProfile string) (*os.File, *os.File) {
 	var cpuFile, memFile *os.File
 	if cpuProfile != "" {
-		f, err := os.Create(cpuProfile)
+		var err error
+		cpuFile, err = os.Create(cpuProfile)
 		if err != nil {
 			log.Fatal("could not create CPU profile: ", err)
 		}
-		cpuFile = f
-		if err := pprof.StartCPUProfile(f); err != nil {
+		if err := pprof.StartCPUProfile(cpuFile); err != nil {
 			log.Fatal("could not start CPU profile: ", err)
 		}
 	}
 	if memProfile != "" {
-		f, err := os.Create(memProfile)
+		var err error
+		memFile, err = os.Create(memProfile)
 		if err != nil {
 			log.Fatal("could not create memory profile: ", err)
 		}
-		memFile = f
 	}
 	return cpuFile, memFile
 }
@@ -274,16 +320,14 @@ func stopProfiling(cpuFile, memFile *os.File) {
 		cpuFile.Close()
 	}
 	if memFile != nil {
-		runtime.GC()
+		runtime.GC() // get up-to-date statistics
 		pprof.WriteHeapProfile(memFile)
 		memFile.Close()
 	}
 }
 
-// Main Program Logic
-
 func main() {
-	// Command-line argument parsing
+	// Parse command-line arguments
 	cpuProfile := flag.String("cpuprofile", "", "write CPU profile to `file`")
 	memProfile := flag.String("memprofile", "", "write memory profile to `file`")
 	flag.Parse()
@@ -299,7 +343,7 @@ func main() {
 	cpuFile, memFile := setupProfiling(*cpuProfile, *memProfile)
 	defer stopProfiling(cpuFile, memFile)
 
-	// Open the XLSX file (ZIP format)
+	// Open the XLSX file
 	r, err := zip.OpenReader(fileName)
 	if err != nil {
 		fmt.Println("Failed to open file:", err)
@@ -343,7 +387,8 @@ func main() {
 				return
 			}
 
-			mergedMap := map[string]string{}
+			// Map merged cell ranges for quick lookup
+			mergedMap := make(map[string]string)
 			for _, mc := range mergedCells {
 				startCell := cellReferenceFromCoordinates(mc.StartColumn, mc.StartRow)
 				endCell := cellReferenceFromCoordinates(mc.EndColumn, mc.EndRow)
@@ -376,7 +421,7 @@ func main() {
 	}
 	wg.Wait()
 
-	// Output format determination and writing
+	// Determine output format and write data
 	outputFormat := strings.Split(filepath.Base(targetPath), ".")[1]
 	switch outputFormat {
 	case "csv":
