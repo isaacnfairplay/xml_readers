@@ -125,90 +125,82 @@ func ReadWorkbook(zipReader *zip.ReadCloser) (*Workbook, error) {
 	return nil, fmt.Errorf("workbook.xml not found")
 }
 
-// Optimized ReadSheetData function using event-driven XML parsing
+// Optimized ReadSheetData function (refactored to reduce size)
 func ReadSheetData(zipReader *zip.ReadCloser, fileName string, sharedStrings *SharedStrings) ([]CellData, error) {
+	var cellData []CellData
+
+	// Iterate over the files in the ZIP archive
 	for _, file := range zipReader.File {
-		if file.Name == fileName {
-			f, err := file.Open()
+		if file.Name != fileName {
+			continue
+		}
+		// Open the current file in the archive
+		f, err := file.Open()
+		if err != nil {
+			return nil, err
+		}
+		defer f.Close()
+
+		// XML Decoder with buffered reader for performance
+		decoder := xml.NewDecoder(bufio.NewReaderSize(f, 64*1024))
+		var currentRow int32
+
+		// Read tokens (start elements, end elements, and values) from the XML file
+		for {
+			t, err := decoder.Token()
 			if err != nil {
+				if err == io.EOF {
+					break
+				}
 				return nil, err
 			}
-			defer f.Close()
 
-			bufferedReader := bufio.NewReaderSize(f, 64*1024)
-			decoder := xml.NewDecoder(bufferedReader)
-
-			var cellData []CellData
-			var currentSheet string
-			var currentRow int32
-			var cell Cell
-
-			for {
-				t, err := decoder.Token()
-				if err != nil {
-					if err == io.EOF {
-						break
-					}
-					return nil, err
-				}
-
-				switch se := t.(type) {
-				case xml.StartElement:
-					if se.Name.Local == "row" {
-						for _, attr := range se.Attr {
-							if attr.Name.Local == "r" {
-								rowNum, _ := strconv.Atoi(attr.Value)
-								currentRow = int32(rowNum)
-							}
+			switch se := t.(type) {
+			case xml.StartElement:
+				switch se.Name.Local {
+				case "row":
+					// Parse row number (attribute 'r')
+					for _, attr := range se.Attr {
+						if attr.Name.Local == "r" {
+							currentRow, _ = Atoi32(attr.Value)
 						}
 					}
+				case "c": // Cell element
+					var cell Cell
+					decoder.DecodeElement(&cell, &se) // Decode cell element directly
 
-					if se.Name.Local == "c" {
-						for _, attr := range se.Attr {
-							if attr.Name.Local == "r" {
-								// Get column and row reference from cell (e.g., "A1")
-								cell.R = attr.Value
-							} else if attr.Name.Local == "t" {
-								// Type attribute, e.g., shared string "s"
-								cell.T = attr.Value
-							}
-						}
-					}
+					// Parse cell reference and get value (from shared strings if applicable)
+					column, _ := parseCellReference(cell.R)
+					value := getCellValue(cell, sharedStrings)
 
-				case xml.EndElement:
-					// End of cell element: decode value and store it
-					if se.Name.Local == "c" {
-						// Handle cell value (shared string or direct value)
-						var value string
-						if cell.T == "s" {
-							// It's a shared string, so look it up
-							idx, _ := strconv.Atoi(cell.V)
-							if idx < len(sharedStrings.Items) {
-								value = sharedStrings.Items[idx]
-							}
-						} else {
-							// It's a regular value (number, etc.)
-							value = cell.V
-						}
-
-						// Parse the cell reference to get the column and row
-						column, _ := parseCellReference(cell.R)
-
-						// Add to cell data
-						cellData = append(cellData, CellData{
-							SheetName:    currentSheet,
-							RowNumber:    currentRow,
-							ColumnNumber: column,
-							SheetValue:   value,
-						})
-					}
+					// Collect data for the current cell
+					cellData = append(cellData, CellData{
+						RowNumber:    currentRow,
+						ColumnNumber: column,
+						SheetValue:   value,
+					})
 				}
 			}
-
-			return cellData, nil
 		}
 	}
-	return nil, fmt.Errorf("sheet file not found")
+
+	return cellData, nil
+}
+
+// Helper function to get the cell value, supports shared strings
+func getCellValue(cell Cell, sharedStrings *SharedStrings) string {
+	if cell.T == "s" { // Shared string case
+		if idx, err := strconv.Atoi(cell.V); err == nil && idx < len(sharedStrings.Items) {
+			return sharedStrings.Items[idx]
+		}
+	}
+	return cell.V // Numeric or other value
+}
+
+// Helper function to parse integer from string to int32
+func Atoi32(s string) (int32, error) {
+	i, err := strconv.Atoi(s)
+	return int32(i), err
 }
 
 // ReadMergedCells extracts merged cell ranges from an XLSX file for a specific sheet.
