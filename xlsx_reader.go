@@ -8,6 +8,7 @@ import (
 	"encoding/xml"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -124,8 +125,8 @@ func ReadWorkbook(zipReader *zip.ReadCloser) (*Workbook, error) {
 	return nil, fmt.Errorf("workbook.xml not found")
 }
 
-// ReadSheetData extracts sheet data from an XLSX file for a specific sheet file.
-func ReadSheetData(zipReader *zip.ReadCloser, fileName string) (*SheetData, error) {
+// Optimized ReadSheetData function
+func ReadSheetData(zipReader *zip.ReadCloser, fileName string, sharedStrings *SharedStrings) ([]CellData, error) {
 	for _, file := range zipReader.File {
 		if file.Name == fileName {
 			f, err := file.Open()
@@ -134,37 +135,79 @@ func ReadSheetData(zipReader *zip.ReadCloser, fileName string) (*SheetData, erro
 			}
 			defer f.Close()
 
+			// Buffer size can be increased depending on file size, but 64KB is a good start
 			bufferedReader := bufio.NewReaderSize(f, 64*1024)
 			decoder := xml.NewDecoder(bufferedReader)
 
-			// Manually parse only the <sheetData> element
-			var sheetData SheetData
-			inSheetData := false
+			var cellData []CellData
+			var currentSheet string // Set the correct sheet name externally
+			var currentRow int32
+
 			for {
+				// Get the next XML token
 				t, err := decoder.Token()
 				if err != nil {
-					break
+					if err == io.EOF {
+						break
+					}
+					return nil, err
 				}
+
 				switch se := t.(type) {
 				case xml.StartElement:
-					if se.Name.Local == "sheetData" {
-						inSheetData = true
-					} else if se.Name.Local == "row" && inSheetData {
-						var row struct {
-							R int32  `xml:"r,attr"`
-							C []Cell `xml:"c"`
-						}
-						if err := decoder.DecodeElement(&row, &se); err == nil {
-							sheetData.Row = append(sheetData.Row, row)
+					// Handle <row> elements
+					if se.Name.Local == "row" {
+						for _, attr := range se.Attr {
+							if attr.Name.Local == "r" {
+								// Parse row number and convert to int32
+								rowNum, parseErr := strconv.Atoi(attr.Value)
+								if parseErr == nil {
+									currentRow = int32(rowNum) // Use currentRow for the row level
+								}
+							}
 						}
 					}
+
+					// Handle <c> elements (cells)
+					if se.Name.Local == "c" {
+						var cell Cell
+						// Decode the cell element
+						if err := decoder.DecodeElement(&cell, &se); err != nil {
+							return nil, err
+						}
+
+						// Parse the cell reference (like "A1")
+						column, _ := parseCellReference(cell.R)
+
+						// Determine the value of the cell
+						var value string
+						if cell.T == "s" { // Shared string
+							idx, parseErr := strconv.Atoi(cell.V)
+							if parseErr == nil && idx < len(sharedStrings.Items) {
+								value = sharedStrings.Items[idx]
+							}
+						} else { // Numeric or other type
+							value = cell.V
+						}
+
+						// Collect the cell data with currentRow now actively used
+						cellData = append(cellData, CellData{
+							SheetName:    currentSheet,
+							RowNumber:    currentRow, // Use the currentRow value
+							ColumnNumber: column,
+							SheetValue:   value,
+						})
+					}
+
 				case xml.EndElement:
-					if se.Name.Local == "sheetData" {
-						inSheetData = false
+					// Reset row data at the end of each <row> element
+					if se.Name.Local == "row" {
+						currentRow = 0
 					}
 				}
 			}
-			return &sheetData, nil
+
+			return cellData, nil
 		}
 	}
 	return nil, fmt.Errorf("sheet file not found")
@@ -310,8 +353,9 @@ func main() {
 	// Process each sheet
 	for _, sheet := range workbook.Sheets.Sheet {
 		sheetFile := fmt.Sprintf("xl/worksheets/sheet%s.xml", sheet.ID)
+
 		// Read sheet data
-		sheetData, err := ReadSheetData(r, sheetFile) // Pass r instead of &r
+		sheetData, err := ReadSheetData(r, sheetFile, sharedStrings) // Pass sharedStrings to help with cell decoding
 		if err != nil {
 			fmt.Printf("Failed to read data for sheet %s: %v\n", sheet.Name, err)
 			continue
@@ -340,36 +384,22 @@ func main() {
 		}
 
 		// Iterate through the rows and cells to collect the data
-		for _, row := range sheetData.Row {
-			for _, cell := range row.C {
-				var value string
-				if cell.T == "s" { // Shared string
-					idx, err := strconv.Atoi(cell.V)
-					if err == nil && idx < len(sharedStrings.Items) {
-						value = sharedStrings.Items[idx]
-					}
-				} else { // Other types (e.g., number)
-					value = cell.V
-				}
-
-				// Parse the cell reference to get column and row
-				column, rowNumber := parseCellReference(cell.R)
-
-				cellData := CellData{
-					SheetName:    sheet.Name,
-					RowNumber:    rowNumber,
-					ColumnNumber: column,
-					SheetValue:   value,
-				}
-
-				// Check if the cell is part of a merged range
-				if mergedRange, ok := mergedMap[cell.R]; ok {
-					cellData.Merged = true
-					cellData.MergedRange = mergedRange
-				}
-
-				data = append(data, cellData)
+		for _, cell := range sheetData {
+			// Populate cell data and check for merged ranges
+			cellData := CellData{
+				SheetName:    sheet.Name,
+				RowNumber:    cell.RowNumber,
+				ColumnNumber: cell.ColumnNumber,
+				SheetValue:   cell.SheetValue,
 			}
+
+			// Check if the cell is part of a merged range
+			if mergedRange, ok := mergedMap[cellReferenceFromCoordinates(cell.ColumnNumber, cell.RowNumber)]; ok {
+				cellData.Merged = true
+				cellData.MergedRange = mergedRange
+			}
+
+			data = append(data, cellData)
 		}
 	}
 
