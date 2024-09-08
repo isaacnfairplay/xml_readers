@@ -7,7 +7,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -27,35 +26,38 @@ type CellData struct {
 	MergedRange  string `json:"merged_range,omitempty"`
 }
 
-// MergedCell represents a merged cell range
-type MergedCell struct {
-	StartRow    int32
-	StartColumn int32
-	EndRow      int32
-	EndColumn   int32
+// BufferedXMLDecoder wraps the xml.Decoder and adds buffered byte reading
+type BufferedXMLDecoder struct {
+	decoder *xml.Decoder
+	buf     []byte // The buffer to hold pre-read data
+	pos     int    // Current reading position in the buffer
+	size    int    // The size of the buffered data
 }
 
-// Cell represents a single cell in a sheet
-type Cell struct {
-	R string `xml:"r,attr"` // Reference (e.g., "A1")
-	T string `xml:"t,attr"` // Type (e.g., "s" for shared string, "n" for number)
-	V string `xml:"v"`      // Value (content of the cell)
+// Initialize the buffered decoder
+func NewBufferedXMLDecoder(r io.Reader) *BufferedXMLDecoder {
+	decoder := xml.NewDecoder(bufio.NewReaderSize(r, 128*1024)) // Using a larger buffer size
+	return &BufferedXMLDecoder{
+		decoder: decoder,
+		buf:     make([]byte, 4096), // Buffer 4 KB at a time
+		pos:     0,
+		size:    0,
+	}
 }
 
-// Workbook represents the workbook.xml structure, containing sheet names
-type Workbook struct {
-	Sheets struct {
-		Sheet []struct {
-			Name string `xml:"name,attr"`
-			ID   string `xml:"sheetId,attr"`
-			RID  string `xml:"r:id,attr"`
-		} `xml:"sheet"`
-	} `xml:"sheets"`
-}
-
-// SharedStrings represents shared strings in the workbook
-type SharedStrings struct {
-	Items []string `xml:"si>t"`
+// Read the next byte from the buffer, refilling it when necessary
+func (bxd *BufferedXMLDecoder) getc() (byte, bool) {
+	if bxd.pos >= bxd.size {
+		n, err := bxd.decoder.InputOffset()
+		if err != nil || n == 0 {
+			return 0, false
+		}
+		bxd.size = n
+		bxd.pos = 0
+	}
+	char := bxd.buf[bxd.pos]
+	bxd.pos++
+	return char, true
 }
 
 // ReadWorkbook extracts the list of sheets from the workbook.xml file.
@@ -76,10 +78,7 @@ func ReadWorkbook(zipReader *zip.ReadCloser) (*Workbook, error) {
 			for {
 				t, err := decoder.Token()
 				if err != nil {
-					if err == io.EOF {
-						break
-					}
-					return nil, err
+					break
 				}
 				switch se := t.(type) {
 				case xml.StartElement:
@@ -107,210 +106,118 @@ func ReadWorkbook(zipReader *zip.ReadCloser) (*Workbook, error) {
 	return nil, fmt.Errorf("workbook.xml not found")
 }
 
-// ReadSharedStrings extracts shared strings from an XLSX file.
-func ReadSharedStrings(zipReader *zip.ReadCloser) (*SharedStrings, error) {
-	for _, file := range zipReader.File {
-		if file.Name == "xl/sharedStrings.xml" {
-			f, err := file.Open()
-			if err != nil {
-				return nil, err
-			}
-			defer f.Close()
-
-			bufferedReader := bufio.NewReaderSize(f, 64*1024) // Buffer for performance
-			decoder := xml.NewDecoder(bufferedReader)
-
-			var sharedStrings SharedStrings
-			for {
-				t, err := decoder.Token()
-				if err != nil {
-					if err == io.EOF {
-						break
-					}
-					return nil, err
-				}
-				switch se := t.(type) {
-				case xml.StartElement:
-					if se.Name.Local == "si" {
-						var text struct {
-							T string `xml:"t"`
-						}
-						if err := decoder.DecodeElement(&text, &se); err == nil {
-							sharedStrings.Items = append(sharedStrings.Items, text.T)
-						}
-					}
-				}
-			}
-			return &sharedStrings, nil
-		}
-	}
-	return nil, fmt.Errorf("shared strings file not found")
-}
-
-// ReadSheetData extracts sheet data from an XLSX file for a specific sheet file.
+// Streamlined ReadSheetData function with buffered XML reader
 func ReadSheetData(zipReader *zip.ReadCloser, fileName string, sharedStrings *SharedStrings) ([]CellData, error) {
+	var cellData []CellData
+
 	for _, file := range zipReader.File {
-		if file.Name == fileName {
-			f, err := file.Open()
+		if file.Name != fileName {
+			continue
+		}
+
+		f, err := file.Open()
+		if err != nil {
+			return nil, err
+		}
+		defer f.Close()
+
+		// Using the buffered XML decoder for performance optimization
+		bxd := NewBufferedXMLDecoder(f)
+		var currentRow int32
+
+		for {
+			t, err := bxd.decoder.Token()
 			if err != nil {
+				if err == io.EOF {
+					break
+				}
 				return nil, err
 			}
-			defer f.Close()
 
-			// Buffered reader for performance
-			decoder := xml.NewDecoder(bufio.NewReaderSize(f, 128*1024))
-			var cellData []CellData
-			var currentRow int32
-
-			for {
-				t, err := decoder.Token()
-				if err != nil {
-					if err == io.EOF {
-						break
-					}
-					return nil, err
-				}
-
-				switch se := t.(type) {
-				case xml.StartElement:
-					if se.Name.Local == "row" {
-						for _, attr := range se.Attr {
-							if attr.Name.Local == "r" {
-								currentRow, _ = Atoi32(attr.Value)
-							}
+			switch se := t.(type) {
+			case xml.StartElement:
+				switch se.Name.Local {
+				case "row":
+					for _, attr := range se.Attr {
+						if attr.Name.Local == "r" {
+							currentRow, _ = Atoi32(attr.Value)
 						}
 					}
+				case "c":
+					var cell Cell
+					bxd.decoder.DecodeElement(&cell, &se)
 
-					if se.Name.Local == "c" {
-						var cell Cell
-						decoder.DecodeElement(&cell, &se)
+					column, _ := parseCellReference(cell.R)
+					value := getCellValue(cell, sharedStrings)
 
-						column, _ := parseCellReference(cell.R)
-						value := getCellValue(cell, sharedStrings)
-
-						cellData = append(cellData, CellData{
-							RowNumber:    currentRow,
-							ColumnNumber: column,
-							SheetValue:   value,
-						})
-					}
+					cellData = append(cellData, CellData{
+						RowNumber:    currentRow,
+						ColumnNumber: column,
+						SheetValue:   value,
+					})
 				}
 			}
-			return cellData, nil
 		}
 	}
-	return nil, fmt.Errorf("sheet file not found")
+	return cellData, nil
 }
 
-// ReadMergedCells extracts merged cell ranges from an XLSX file for a specific sheet.
-func ReadMergedCells(zipReader *zip.ReadCloser, fileName string) ([]MergedCell, error) {
-	for _, file := range zipReader.File {
-		if file.Name == fileName {
-			f, err := file.Open()
-			if err != nil {
-				return nil, err
-			}
-			defer f.Close()
+// Pre-allocate space for merged cell ranges and map them efficiently
+func PreAllocateMergedCells(sheetData []CellData, mergedCells []MergedCell) map[string]string {
+	mergedMap := make(map[string]string, len(mergedCells)) // Pre-allocated based on the number of merged cells
+	for _, mc := range mergedCells {
+		startCell := cellReferenceFromCoordinates(mc.StartColumn, mc.StartRow)
+		endCell := cellReferenceFromCoordinates(mc.EndColumn, mc.EndRow)
+		mergedRange := fmt.Sprintf("%s:%s", startCell, endCell)
 
-			var mergeCells struct {
-				Cells []struct {
-					Ref string `xml:"ref,attr"`
-				} `xml:"mergeCells>mergeCell"`
+		for col := mc.StartColumn; col <= mc.EndColumn; col++ {
+			for row := mc.StartRow; row <= mc.EndRow; row++ {
+				cellRef := cellReferenceFromCoordinates(col, row)
+				mergedMap[cellRef] = mergedRange
 			}
-			decoder := xml.NewDecoder(f)
-			if err := decoder.Decode(&mergeCells); err != nil {
-				return nil, err
-			}
-
-			var mergedCells []MergedCell
-			for _, cell := range mergeCells.Cells {
-				startCol, startRow, endCol, endRow := parseMergedCellRange(cell.Ref)
-				mergedCells = append(mergedCells, MergedCell{
-					StartRow:    startRow,
-					StartColumn: startCol,
-					EndRow:      endRow,
-					EndColumn:   endCol,
-				})
-			}
-			return mergedCells, nil
 		}
 	}
-	return nil, nil
+	return mergedMap
 }
 
-// Utility: Parse cell reference like "A1" and return column and row as int32
-func parseCellReference(ref string) (int32, int32) {
-	col := int32(0)
-	row := int32(0)
-	for i := 0; i < len(ref); i++ {
-		if ref[i] >= 'A' && ref[i] <= 'Z' {
-			col = int32(col*26 + int32(ref[i]-'A'+1))
-		} else {
-			rowPart, _ := strconv.Atoi(ref[i:])
-			row = int32(rowPart)
-			break
-		}
-	}
-	return col, row
-}
-
-// Utility: Parse merged cell range like "A1:B2" and return start and end rows/columns
-func parseMergedCellRange(ref string) (int32, int32, int32, int32) {
-	parts := strings.Split(ref, ":")
-	if len(parts) == 2 {
-		startCol, startRow := parseCellReference(parts[0])
-		endCol, endRow := parseCellReference(parts[1])
-		return startCol, startRow, endCol, endRow
-	}
-	return 0, 0, 0, 0
-}
-
-// Utility: Create cell reference from column and row (e.g., 1, 1 becomes "A1")
-func cellReferenceFromCoordinates(col int32, row int32) string {
-	colRef := ""
-	for col > 0 {
-		colRef = string('A'+(col-1)%26) + colRef
-		col = (col - 1) / 26
-	}
-	return fmt.Sprintf("%s%d", colRef, row)
-}
-
-// Utility: Get cell value, handles shared strings
-func getCellValue(cell Cell, sharedStrings *SharedStrings) string {
-	if cell.T == "s" { // Shared string
-		if idx, err := strconv.Atoi(cell.V); err == nil && idx < len(sharedStrings.Items) {
-			return sharedStrings.Items[idx]
-		}
-	}
-	return cell.V // Numeric or other type
-}
-
-// Utility: Convert string to int32
+// Helper function to parse integer from string to int32
 func Atoi32(s string) (int32, error) {
 	i, err := strconv.Atoi(s)
 	return int32(i), err
 }
 
+// Helper function to get the cell value, supports shared strings
+func getCellValue(cell Cell, sharedStrings *SharedStrings) string {
+	if cell.T == "s" {
+		if idx, err := strconv.Atoi(cell.V); err == nil && idx < len(sharedStrings.Items) {
+			return sharedStrings.Items[idx]
+		}
+	}
+	return cell.V
+}
+
 // Profiling setup and teardown
-func setupProfiling(cpuProfile, memProfile string) (*os.File, *os.File) {
+func setupProfiling(cpuProfile string, memProfile string) (*os.File, *os.File) {
 	var cpuFile, memFile *os.File
+	var err error
+
 	if cpuProfile != "" {
-		var err error
 		cpuFile, err = os.Create(cpuProfile)
 		if err != nil {
-			log.Fatal("could not create CPU profile: ", err)
+			fmt.Println("Failed to create CPU profile file:", err)
 		}
 		if err := pprof.StartCPUProfile(cpuFile); err != nil {
-			log.Fatal("could not start CPU profile: ", err)
+			fmt.Println("Failed to start CPU profile:", err)
 		}
 	}
+
 	if memProfile != "" {
-		var err error
 		memFile, err = os.Create(memProfile)
 		if err != nil {
-			log.Fatal("could not create memory profile: ", err)
+			fmt.Println("Failed to create memory profile file:", err)
 		}
 	}
+
 	return cpuFile, memFile
 }
 
@@ -319,15 +226,20 @@ func stopProfiling(cpuFile, memFile *os.File) {
 		pprof.StopCPUProfile()
 		cpuFile.Close()
 	}
+
 	if memFile != nil {
-		runtime.GC() // get up-to-date statistics
-		pprof.WriteHeapProfile(memFile)
+		runtime.GC() // Get up-to-date statistics for the memory profile
+		if err := pprof.WriteHeapProfile(memFile); err != nil {
+			fmt.Println("Failed to write memory profile:", err)
+		}
 		memFile.Close()
 	}
 }
 
+// Main Program Logic
+
 func main() {
-	// Parse command-line arguments
+	// Command-line argument parsing
 	cpuProfile := flag.String("cpuprofile", "", "write CPU profile to `file`")
 	memProfile := flag.String("memprofile", "", "write memory profile to `file`")
 	flag.Parse()
@@ -343,7 +255,7 @@ func main() {
 	cpuFile, memFile := setupProfiling(*cpuProfile, *memProfile)
 	defer stopProfiling(cpuFile, memFile)
 
-	// Open the XLSX file
+	// Open the XLSX file (ZIP format)
 	r, err := zip.OpenReader(fileName)
 	if err != nil {
 		fmt.Println("Failed to open file:", err)
@@ -387,20 +299,7 @@ func main() {
 				return
 			}
 
-			// Map merged cell ranges for quick lookup
-			mergedMap := make(map[string]string)
-			for _, mc := range mergedCells {
-				startCell := cellReferenceFromCoordinates(mc.StartColumn, mc.StartRow)
-				endCell := cellReferenceFromCoordinates(mc.EndColumn, mc.EndRow)
-				mergedRange := fmt.Sprintf("%s:%s", startCell, endCell)
-
-				for col := mc.StartColumn; col <= mc.EndColumn; col++ {
-					for row := mc.StartRow; row <= mc.EndRow; row++ {
-						cellRef := cellReferenceFromCoordinates(col, row)
-						mergedMap[cellRef] = mergedRange
-					}
-				}
-			}
+			mergedMap := PreAllocateMergedCells(sheetData, mergedCells)
 
 			for _, cell := range sheetData {
 				cellData := CellData{
@@ -421,7 +320,7 @@ func main() {
 	}
 	wg.Wait()
 
-	// Determine output format and write data
+	// Output format determination and writing
 	outputFormat := strings.Split(filepath.Base(targetPath), ".")[1]
 	switch outputFormat {
 	case "csv":
