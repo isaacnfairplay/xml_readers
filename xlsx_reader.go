@@ -157,7 +157,7 @@ func ReadSharedStrings(zipReader *zip.ReadCloser) (*SharedStrings, error) {
 	return nil, fmt.Errorf("shared strings file not found")
 }
 
-// Read sheet data and return parsed cell data
+// Read sheet data and return parsed cell data using xml.RawToken for performance
 func ReadSheetData(zipReader *zip.ReadCloser, fileName string, sharedStrings *SharedStrings) ([]CellData, error) {
 	var cellData []CellData
 	for _, file := range zipReader.File {
@@ -170,32 +170,60 @@ func ReadSheetData(zipReader *zip.ReadCloser, fileName string, sharedStrings *Sh
 
 			decoder := xml.NewDecoder(bufio.NewReaderSize(f, 128*1024))
 			var currentRow int32
+			var currentCol int32
+			var currentValue string
+			var cell Cell // Define cell variable here
 
+			// RawToken will return tokens without unnecessary overhead
 			for {
-				t, err := decoder.Token()
+				t, err := decoder.RawToken()
 				if err != nil {
 					if err == io.EOF {
 						break
 					}
 					return nil, err
 				}
-				if startElem, ok := t.(xml.StartElement); ok {
-					switch startElem.Name.Local {
+
+				switch token := t.(type) {
+				case xml.StartElement:
+					switch token.Name.Local {
 					case "row":
-						for _, attr := range startElem.Attr {
+						// Capture row number from the attributes
+						for _, attr := range token.Attr {
 							if attr.Name.Local == "r" {
 								rowInt, _ := strconv.ParseInt(attr.Value, 10, 32)
 								currentRow = int32(rowInt)
 							}
 						}
 					case "c":
-						var cell Cell
-						decoder.DecodeElement(&cell, &startElem)
-						col, _ := parseCellReference(cell.R)
-						val := getCellValue(cell, sharedStrings)
+						// Capture cell reference (e.g., A1) and type (e.g., "s" for shared string)
+						cell = Cell{} // Reinitialize cell variable for each <c> element
+						for _, attr := range token.Attr {
+							switch attr.Name.Local {
+							case "r":
+								currentCol, _ = parseCellReference(attr.Value)
+							case "t":
+								cell.T = attr.Value
+							}
+						}
+					case "v":
+						// Capture the cell value (this is a RawToken, so we may get just the content)
+						t, err := decoder.RawToken() // Capture text between <v>...</v>
+						if err != nil {
+							return nil, err
+						}
+						if charData, ok := t.(xml.CharData); ok {
+							currentValue = string(charData)
+						}
+					}
+
+				case xml.EndElement:
+					if token.Name.Local == "c" {
+						// Finished processing a cell, get the value
+						val := getCellValue(Cell{T: cell.T, V: currentValue}, sharedStrings)
 						cellData = append(cellData, CellData{
 							RowNumber:    currentRow,
-							ColumnNumber: col,
+							ColumnNumber: currentCol,
 							SheetValue:   val,
 						})
 					}
